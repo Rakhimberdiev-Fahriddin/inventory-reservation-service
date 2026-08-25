@@ -1,6 +1,14 @@
 package handler
 
-import "testing"
+import (
+	"database/sql"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/DATA-DOG/go-sqlmock"
+)
 
 func TestValidateCreateReservationRequest(t *testing.T) {
 	tests := []struct {
@@ -82,5 +90,102 @@ func TestValidateCreateReservationRequest(t *testing.T) {
 				)
 			}
 		})
+	}
+}
+
+func TestCreateReservation(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	h := NewHandler(db)
+
+	mock.ExpectBegin()
+
+	// Idempotency key mavjud emas.
+	mock.ExpectQuery("SELECT reservation_id").
+		WithArgs("test-001").
+		WillReturnError(sql.ErrNoRows)
+
+	// Warehouse mavjud.
+	mock.ExpectQuery("SELECT EXISTS").
+		WithArgs(int64(1)).
+		WillReturnRows(
+			sqlmock.NewRows([]string{"exists"}).
+				AddRow(true),
+		)
+
+	// Stock mavjud va yetarli.
+	mock.ExpectQuery("SELECT quantity").
+		WithArgs(int64(1), int64(1)).
+		WillReturnRows(
+			sqlmock.NewRows([]string{"quantity"}).
+				AddRow(10),
+		)
+
+	// Reservation yaratildi.
+	mock.ExpectQuery("INSERT INTO reservations").
+		WithArgs(int64(1)).
+		WillReturnRows(
+			sqlmock.NewRows([]string{"id"}).
+				AddRow(int64(1)),
+		)
+
+	// Reservation item yaratildi.
+	mock.ExpectExec("INSERT INTO reservation_items").
+		WithArgs(int64(1), int64(1), 5).
+		WillReturnResult(
+			sqlmock.NewResult(1, 1),
+		)
+
+	// Stock kamaytirildi.
+	mock.ExpectExec("UPDATE stock").
+		WithArgs(5, int64(1), int64(1)).
+		WillReturnResult(
+			sqlmock.NewResult(1, 1),
+		)
+
+	// Idempotency key saqlandi.
+	mock.ExpectExec("INSERT INTO idempotency_keys").
+		WithArgs("test-001", int64(1)).
+		WillReturnResult(
+			sqlmock.NewResult(1, 1),
+		)
+
+	mock.ExpectCommit()
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/reservations",
+		strings.NewReader(`{
+			"warehouse_id": 1,
+			"items": [
+				{
+					"product_id": 1,
+					"quantity": 5
+				}
+			]
+		}`),
+	)
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", "test-001")
+
+	rec := httptest.NewRecorder()
+
+	h.CreateReservation(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf(
+			"expected status %d, got %d",
+			http.StatusCreated,
+			rec.Code,
+		)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
 	}
 }
