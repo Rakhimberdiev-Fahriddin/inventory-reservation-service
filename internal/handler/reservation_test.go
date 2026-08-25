@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"database/sql"
 	"net/http"
 	"net/http/httptest"
@@ -104,12 +105,10 @@ func TestCreateReservation(t *testing.T) {
 
 	mock.ExpectBegin()
 
-	// Idempotency key mavjud emas.
 	mock.ExpectQuery("SELECT reservation_id").
 		WithArgs("test-001").
 		WillReturnError(sql.ErrNoRows)
 
-	// Warehouse mavjud.
 	mock.ExpectQuery("SELECT EXISTS").
 		WithArgs(int64(1)).
 		WillReturnRows(
@@ -117,7 +116,6 @@ func TestCreateReservation(t *testing.T) {
 				AddRow(true),
 		)
 
-	// Stock mavjud va yetarli.
 	mock.ExpectQuery("SELECT quantity").
 		WithArgs(int64(1), int64(1)).
 		WillReturnRows(
@@ -125,7 +123,6 @@ func TestCreateReservation(t *testing.T) {
 				AddRow(10),
 		)
 
-	// Reservation yaratildi.
 	mock.ExpectQuery("INSERT INTO reservations").
 		WithArgs(int64(1)).
 		WillReturnRows(
@@ -133,21 +130,18 @@ func TestCreateReservation(t *testing.T) {
 				AddRow(int64(1)),
 		)
 
-	// Reservation item yaratildi.
 	mock.ExpectExec("INSERT INTO reservation_items").
 		WithArgs(int64(1), int64(1), 5).
 		WillReturnResult(
 			sqlmock.NewResult(1, 1),
 		)
 
-	// Stock kamaytirildi.
 	mock.ExpectExec("UPDATE stock").
 		WithArgs(5, int64(1), int64(1)).
 		WillReturnResult(
 			sqlmock.NewResult(1, 1),
 		)
 
-	// Idempotency key saqlandi.
 	mock.ExpectExec("INSERT INTO idempotency_keys").
 		WithArgs("test-001", int64(1)).
 		WillReturnResult(
@@ -201,12 +195,10 @@ func TestCreateReservation_InsufficientStock(t *testing.T) {
 
 	mock.ExpectBegin()
 
-	// Idempotency key mavjud emas.
 	mock.ExpectQuery("SELECT reservation_id").
 		WithArgs("test-insufficient-001").
 		WillReturnError(sql.ErrNoRows)
 
-	// Warehouse mavjud.
 	mock.ExpectQuery("SELECT EXISTS").
 		WithArgs(int64(1)).
 		WillReturnRows(
@@ -214,7 +206,6 @@ func TestCreateReservation_InsufficientStock(t *testing.T) {
 				AddRow(true),
 		)
 
-	// Stock mavjud, lekin quantity yetarli emas.
 	mock.ExpectQuery("SELECT quantity").
 		WithArgs(int64(1), int64(1)).
 		WillReturnRows(
@@ -222,7 +213,6 @@ func TestCreateReservation_InsufficientStock(t *testing.T) {
 				AddRow(3),
 		)
 
-	// Transaction rollback bo'lishi kerak.
 	mock.ExpectRollback()
 
 	req := httptest.NewRequest(
@@ -316,6 +306,7 @@ func TestCreateReservation_WarehouseNotFound(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
 func TestCreateReservation_Idempotency(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -373,6 +364,371 @@ func TestCreateReservation_Idempotency(t *testing.T) {
 			expectedResponse,
 			strings.TrimSpace(rec.Body.String()),
 		)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCancelReservation_Success(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	h := NewHandler(db)
+
+	mock.ExpectBegin()
+
+	mock.ExpectQuery("SELECT warehouse_id, status").
+		WithArgs(int64(1)).
+		WillReturnRows(
+			sqlmock.NewRows([]string{"warehouse_id", "status"}).
+				AddRow(int64(1), "active"),
+		)
+
+	mock.ExpectQuery("SELECT product_id, quantity").
+		WithArgs(int64(1)).
+		WillReturnRows(
+			sqlmock.NewRows([]string{"product_id", "quantity"}).
+				AddRow(int64(1), 5),
+		)
+
+	mock.ExpectExec("UPDATE stock").
+		WithArgs(5, int64(1), int64(1)).
+		WillReturnResult(
+			sqlmock.NewResult(1, 1),
+		)
+
+	mock.ExpectExec("UPDATE reservations").
+		WithArgs(int64(1)).
+		WillReturnResult(
+			sqlmock.NewResult(1, 1),
+		)
+
+	mock.ExpectCommit()
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/reservations/1/cancel",
+		nil,
+	)
+
+	req.SetPathValue("reservation_id", "1")
+
+	rec := httptest.NewRecorder()
+
+	h.CancelReservation(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf(
+			"expected status %d, got %d",
+			http.StatusNoContent,
+			rec.Code,
+		)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCancelReservation_Confirmed(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	h := NewHandler(db)
+
+	mock.ExpectBegin()
+
+	mock.ExpectQuery("SELECT warehouse_id, status").
+		WithArgs(int64(1)).
+		WillReturnRows(
+			sqlmock.NewRows([]string{"warehouse_id", "status"}).
+				AddRow(int64(1), "confirmed"),
+		)
+
+	mock.ExpectRollback()
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/reservations/1/cancel",
+		nil,
+	)
+
+	req.SetPathValue("reservation_id", "1")
+
+	rec := httptest.NewRecorder()
+
+	h.CancelReservation(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf(
+			"expected status %d, got %d",
+			http.StatusConflict,
+			rec.Code,
+		)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCancelReservation_NotFound(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	h := NewHandler(db)
+
+	mock.ExpectBegin()
+
+	mock.ExpectQuery("SELECT warehouse_id, status").
+		WithArgs(int64(999)).
+		WillReturnError(sql.ErrNoRows)
+
+	mock.ExpectRollback()
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/reservations/999/cancel",
+		nil,
+	)
+
+	req.SetPathValue("reservation_id", "999")
+
+	rec := httptest.NewRecorder()
+
+	h.CancelReservation(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf(
+			"expected status %d, got %d",
+			http.StatusNotFound,
+			rec.Code,
+		)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConfirmReservation_Success(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	h := NewHandler(db)
+
+	mock.ExpectBegin()
+
+	mock.ExpectQuery("SELECT status").
+		WithArgs(int64(1)).
+		WillReturnRows(
+			sqlmock.NewRows([]string{"status"}).
+				AddRow("active"),
+		)
+
+	mock.ExpectExec("UPDATE reservations").
+		WithArgs(int64(1)).
+		WillReturnResult(
+			sqlmock.NewResult(1, 1),
+		)
+
+	mock.ExpectCommit()
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/reservations/1/confirm",
+		nil,
+	)
+
+	req.SetPathValue("reservation_id", "1")
+
+	rec := httptest.NewRecorder()
+
+	h.ConfirmReservation(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf(
+			"expected status %d, got %d",
+			http.StatusNoContent,
+			rec.Code,
+		)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConfirmReservation_Cancelled(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	h := NewHandler(db)
+
+	mock.ExpectBegin()
+
+	mock.ExpectQuery("SELECT status").
+		WithArgs(int64(1)).
+		WillReturnRows(
+			sqlmock.NewRows([]string{"status"}).
+				AddRow("cancelled"),
+		)
+
+	mock.ExpectRollback()
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/reservations/1/confirm",
+		nil,
+	)
+
+	req.SetPathValue("reservation_id", "1")
+
+	rec := httptest.NewRecorder()
+
+	h.ConfirmReservation(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf(
+			"expected status %d, got %d",
+			http.StatusConflict,
+			rec.Code,
+		)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConfirmReservation_NotFound(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	h := NewHandler(db)
+
+	mock.ExpectBegin()
+
+	mock.ExpectQuery("SELECT status").
+		WithArgs(int64(999)).
+		WillReturnError(sql.ErrNoRows)
+
+	mock.ExpectRollback()
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/reservations/999/confirm",
+		nil,
+	)
+
+	req.SetPathValue("reservation_id", "999")
+
+	rec := httptest.NewRecorder()
+
+	h.ConfirmReservation(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf(
+			"expected status %d, got %d",
+			http.StatusNotFound,
+			rec.Code,
+		)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExpireReservations_Success(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	h := NewHandler(db)
+
+	mock.ExpectBegin()
+
+	mock.ExpectQuery("SELECT id, warehouse_id").
+		WillReturnRows(
+			sqlmock.NewRows([]string{"id", "warehouse_id"}).
+				AddRow(int64(1), int64(1)),
+		)
+
+	mock.ExpectQuery("SELECT product_id, quantity").
+		WithArgs(int64(1)).
+		WillReturnRows(
+			sqlmock.NewRows([]string{"product_id", "quantity"}).
+				AddRow(int64(1), 5),
+		)
+
+	mock.ExpectExec("UPDATE stock").
+		WithArgs(5, int64(1), int64(1)).
+		WillReturnResult(
+			sqlmock.NewResult(1, 1),
+		)
+
+	mock.ExpectExec("UPDATE reservations").
+		WithArgs(int64(1)).
+		WillReturnResult(
+			sqlmock.NewResult(1, 1),
+		)
+
+	mock.ExpectCommit()
+
+	err = h.ExpireReservations(context.Background())
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExpireReservations_NoExpiredReservations(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	h := NewHandler(db)
+
+	mock.ExpectBegin()
+
+	mock.ExpectQuery("SELECT id, warehouse_id").
+		WillReturnRows(
+			sqlmock.NewRows([]string{"id", "warehouse_id"}),
+		)
+
+	mock.ExpectCommit()
+
+	err = h.ExpireReservations(context.Background())
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {
