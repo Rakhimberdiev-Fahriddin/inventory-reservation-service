@@ -189,3 +189,193 @@ func TestCreateReservation(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestCreateReservation_InsufficientStock(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	h := NewHandler(db)
+
+	mock.ExpectBegin()
+
+	// Idempotency key mavjud emas.
+	mock.ExpectQuery("SELECT reservation_id").
+		WithArgs("test-insufficient-001").
+		WillReturnError(sql.ErrNoRows)
+
+	// Warehouse mavjud.
+	mock.ExpectQuery("SELECT EXISTS").
+		WithArgs(int64(1)).
+		WillReturnRows(
+			sqlmock.NewRows([]string{"exists"}).
+				AddRow(true),
+		)
+
+	// Stock mavjud, lekin quantity yetarli emas.
+	mock.ExpectQuery("SELECT quantity").
+		WithArgs(int64(1), int64(1)).
+		WillReturnRows(
+			sqlmock.NewRows([]string{"quantity"}).
+				AddRow(3),
+		)
+
+	// Transaction rollback bo'lishi kerak.
+	mock.ExpectRollback()
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/reservations",
+		strings.NewReader(`{
+			"warehouse_id": 1,
+			"items": [
+				{
+					"product_id": 1,
+					"quantity": 5
+				}
+			]
+		}`),
+	)
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", "test-insufficient-001")
+
+	rec := httptest.NewRecorder()
+
+	h.CreateReservation(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf(
+			"expected status %d, got %d",
+			http.StatusConflict,
+			rec.Code,
+		)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCreateReservation_WarehouseNotFound(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	h := NewHandler(db)
+
+	mock.ExpectBegin()
+
+	mock.ExpectQuery("SELECT reservation_id").
+		WithArgs("test-warehouse-001").
+		WillReturnError(sql.ErrNoRows)
+
+	mock.ExpectQuery("SELECT EXISTS").
+		WithArgs(int64(999)).
+		WillReturnRows(
+			sqlmock.NewRows([]string{"exists"}).
+				AddRow(false),
+		)
+
+	mock.ExpectRollback()
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/reservations",
+		strings.NewReader(`{
+			"warehouse_id": 999,
+			"items": [
+				{
+					"product_id": 1,
+					"quantity": 5
+				}
+			]
+		}`),
+	)
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", "test-warehouse-001")
+
+	rec := httptest.NewRecorder()
+
+	h.CreateReservation(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf(
+			"expected status %d, got %d",
+			http.StatusNotFound,
+			rec.Code,
+		)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+func TestCreateReservation_Idempotency(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	h := NewHandler(db)
+
+	mock.ExpectBegin()
+
+	mock.ExpectQuery("SELECT reservation_id").
+		WithArgs("test-idempotency-001").
+		WillReturnRows(
+			sqlmock.NewRows([]string{"reservation_id"}).
+				AddRow(int64(10)),
+		)
+
+	mock.ExpectRollback()
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/reservations",
+		strings.NewReader(`{
+			"warehouse_id": 1,
+			"items": [
+				{
+					"product_id": 1,
+					"quantity": 5
+				}
+			]
+		}`),
+	)
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", "test-idempotency-001")
+
+	rec := httptest.NewRecorder()
+
+	h.CreateReservation(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf(
+			"expected status %d, got %d",
+			http.StatusCreated,
+			rec.Code,
+		)
+	}
+
+	expectedResponse := `{"reservation_id":10}`
+
+	if strings.TrimSpace(rec.Body.String()) != expectedResponse {
+		t.Fatalf(
+			"expected response %s, got %s",
+			expectedResponse,
+			strings.TrimSpace(rec.Body.String()),
+		)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
