@@ -77,10 +77,16 @@ Check running containers:
 docker compose ps
 ```
 
-The application connects to:
+The application connects to (matching the credentials in `docker-compose.yml`):
 
 ```text
-postgres://postgres:1@localhost:5432/inventory_db
+postgres://postgres:1@localhost:5432/inventory_db?sslmode=disable
+```
+
+This can be overridden with the `DATABASE_URL` environment variable, e.g.:
+
+```bash
+DATABASE_URL="postgres://postgres:1@localhost:5432/inventory_db?sslmode=disable" go run cmd/main.go
 ```
 
 ## Migrations
@@ -283,7 +289,41 @@ curl -X POST http://localhost:8080/reservations \
 
 returns the existing reservation ID instead of creating another reservation.
 
-The key is stored in the `idempotency_keys` table.
+The key is stored in the `idempotency_keys` table, with a `UNIQUE` constraint on `idempotency_key`. If two requests carrying the same key race each other, both may pass the initial lookup before either commits; the constraint guarantees only one `INSERT` succeeds, and the losing request rolls back its own reservation/stock changes and returns the winner's `reservation_id` instead of erroring. See the "Assumptions" and "Known limitations" sections below for the scope of this strategy.
+
+## Get Reservation
+
+```http
+GET /reservations/{reservation_id}
+```
+
+Example:
+
+```bash
+curl http://localhost:8080/reservations/1
+```
+
+Response:
+
+```json
+{
+  "id": 1,
+  "warehouse_id": 1,
+  "status": "active",
+  "created_at": "2026-01-01T10:00:00Z",
+  "expires_at": "2026-01-01T10:15:00Z",
+  "items": [
+    { "product_id": 1, "quantity": 5 }
+  ]
+}
+```
+
+Possible errors:
+
+```text
+400 invalid reservation id
+404 reservation not found
+```
 
 ## Reservation Lifecycle
 
@@ -359,11 +399,14 @@ active → confirmed
 
 A confirmed reservation cannot be cancelled.
 
+`ConfirmReservation` also performs a **lazy expiration check**: even if the background worker (see below) hasn't processed this reservation yet, confirming re-reads `expires_at` and, if it has already passed while the status is still `active`, restores stock, marks the reservation `cancelled`, and returns `409` instead of confirming it. This closes the gap between "expiration time reached" and "background worker noticed" — the assignment requires that "an expired reservation cannot be confirmed" and that the database is the source of truth for expiration, not the worker's schedule.
+
 Possible errors:
 
 ```text
 404 reservation not found
 409 reservation cannot be confirmed
+409 reservation expired
 ```
 
 ## Reservation Expiration
@@ -442,6 +485,42 @@ FOR UPDATE
 This prevents concurrent reservation requests from incorrectly using the same stock.
 
 For example, if the available stock is `10` and two requests simultaneously try to reserve `8`, PostgreSQL row locking ensures that both transactions cannot independently reserve the same `10` units.
+
+## Testing
+
+### Unit tests (no database required)
+
+Handler-level unit tests use `sqlmock` to verify request validation, status-code mapping, and the exact SQL each code path issues, without a real database:
+
+```bash
+go test ./...
+```
+
+### Integration tests (real PostgreSQL required)
+
+The assignment requires that concurrency and reservation-lifecycle behaviour be proven against a real PostgreSQL database, not a mock — a mock cannot reproduce actual row locking. `internal/handler/integration_test.go` covers:
+
+- Multi-item reservation: insufficient stock on one item leaves *all* items unreserved (all-or-nothing).
+- Two concurrent requests competing for stock that can only satisfy one of them — exactly one succeeds, stock never goes negative or gets double-decremented.
+- A retried request with the same `Idempotency-Key` (including *concurrently* retried) creates exactly one reservation.
+- Cancelling a reservation restores stock.
+- Confirming a reservation whose `expires_at` has passed but whose background-worker cleanup hasn't run yet is rejected and stock is restored (lazy expiration).
+- Invalid (negative) quantities are rejected without touching stock.
+
+To run them:
+
+```bash
+docker compose up -d
+
+migrate -path ./migrations \
+  -database "postgres://postgres:1@localhost:5432/inventory_db?sslmode=disable" \
+  up
+
+TEST_DATABASE_URL="postgres://postgres:1@localhost:5432/inventory_db?sslmode=disable" \
+  go test ./internal/handler/... -run Integration -v
+```
+
+If `TEST_DATABASE_URL` is not set, these tests are automatically skipped, so plain `go test ./...` always passes without Docker running.
 
 ## Error Status Codes
 
@@ -532,6 +611,46 @@ Expected:
 409 Conflict
 reservation cannot be cancelled
 ```
+
+## Assumptions
+
+- `Idempotency-Key` is a required request header for `POST /reservations`; there is no request-body alternative.
+- Available stock is modeled as `stock.quantity` decremented immediately at reservation creation and restored on cancel/expire — not as `physical_stock - SUM(active reservations)` computed on read. Both are externally equivalent as long as every code path that ends a reservation's "active" life (cancel, confirm-time lazy expiration, background worker) reliably restores stock, which is the case here.
+- A reservation's items belong to exactly one warehouse; there's no cross-warehouse reservation.
+- Confirming or cancelling an already-`confirmed`/`cancelled` reservation is an error (`409`), not a silent no-op — repeated *confirm*/*cancel* calls on the same terminal state are expected to fail loudly rather than succeed idempotently. (This is separate from the idempotency guarantee on *creation*, which is required by the assignment and does apply.)
+- `AddStock` only increments an existing `(warehouse_id, product_id)` stock row; it does not create one. Initial stock rows are expected to be seeded directly (there's no product/warehouse-creation endpoint in scope).
+- Quantities are plain integers (no fractional/weighted units).
+
+## Important Tradeoffs
+
+- **Stock is decremented at creation time, not at confirmation.** This means a browsing customer who creates a reservation genuinely removes stock from what other customers can see/reserve for up to 15 minutes, even if they never confirm. The alternative (decrement only at confirm) would let more customers *attempt* checkout concurrently but risks confirm-time failures after the customer thinks checkout succeeded. This project follows the assignment's definition literally (`available = physical - active reservations`) and prioritizes a strict "no overselling" guarantee over checkout-time UX.
+- **Lazy expiration was added at confirm-time only, not at read-time (`GetStock`/`GetReservation`).** `GetStock` reflects the physical `stock.quantity` row, which is only corrected when a reservation is cancelled, confirmed-and-rejected-as-expired, or swept by the background worker — so immediately after an unnoticed expiration, `GET stock` can under-report availability by the expired amount until the next worker tick (at most ~1 minute). Confirm was the one place this actually mattered for correctness (the assignment explicitly forbids confirming an expired reservation), so that's where the lazy check was added rather than everywhere.
+- **The idempotency race is resolved via the database's `UNIQUE` constraint plus a Postgres-specific error-code check (`23505`)**, rather than an application-level lock. This is simpler and correctly serializes concurrent creates, but ties the retry-recovery path to PostgreSQL's error reporting.
+- **A background worker (1-minute ticker) is used for eventual expiration cleanup**, in addition to the confirm-time lazy check, rather than relying on lazy expiration alone everywhere. The assignment says a worker isn't required; it's kept here because `GetStock`/`GetReservation` don't otherwise self-correct, and a worker bounds how stale stock/reservation state can get.
+
+## Known Limitations
+
+- `GetStock` and `GetReservation` do not lazily expire on read — only `ConfirmReservation` does. A reservation can appear `active` in `GET /reservations/{id}` for up to ~1 minute past its `expires_at` before the background worker (or a confirm attempt) corrects it.
+- `AddStock` cannot create a new `(warehouse_id, product_id)` stock row — there is no stock-creation/upsert endpoint, so products/warehouses/initial stock must be seeded directly in the database.
+- If a duplicate `Idempotency-Key` is reused with a **different** request body (different warehouse/items/quantities), the original reservation is still returned; the new body is silently ignored rather than rejected with a conflict. The assignment doesn't require body-matching validation, but a stricter implementation would hash and compare the stored request body.
+- The background expiration worker runs on every instance of the service (no leader election / distributed lock around it); with multiple instances each will attempt the same sweep every minute. This is safe (each reservation's `UPDATE` is transactional and idempotent-in-effect — a second sweep finds nothing left to expire) but does mean redundant work under horizontal scaling.
+- No authentication/authorization, rate limiting, or pagination on any endpoint (explicitly out of scope per the assignment).
+- No structured logging/metrics/tracing — only `log.Println`.
+
+## What I Would Improve With More Time
+
+- Add a stock-creation/upsert endpoint (or an explicit `POST /warehouses/{id}/products/{id}/stock` "initialize" call) instead of requiring manual seeding.
+- Add lazy expiration to `GetReservation`/`GetStock` as well, so reads never show a stale `active` reservation, closing the ~1-minute staleness window described above.
+- Validate that a retried `Idempotency-Key` request body matches the original (store a hash of the normalized request alongside the key) and return `409` on mismatch instead of silently returning the original reservation.
+- Add a `GET /reservations?warehouse_id=&status=` listing endpoint for observability/debugging.
+- Replace the polling background worker with `pg_cron` or a `SELECT ... FOR UPDATE SKIP LOCKED` batched sweep, so multiple instances don't redundantly scan the same rows every minute.
+- Add structured logging (request IDs, reservation IDs) and basic metrics (reservations created/confirmed/cancelled/expired counters) for observability.
+
+## Submission Note
+
+- **Time spent:** approximately 6-8 hours (assignment's target range), across initial implementation and a follow-up review-and-fix pass covering the items in "Known Limitations" above.
+- **Incomplete requirements:** none of the required endpoints/behaviors are missing as of the commit being submitted; see "Known Limitations" for scoped-out edge cases and "What I Would Improve" for follow-up work.
+- Fill in the repository URL and commit hash being submitted here before sending this in.
 
 ## Git Commit History
 

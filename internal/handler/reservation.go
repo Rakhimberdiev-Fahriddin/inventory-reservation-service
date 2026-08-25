@@ -9,6 +9,9 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 type CreateReservationRequest struct {
@@ -23,8 +26,92 @@ type CreateReservationItemRequest struct {
 
 var ErrInsufficientStock = errors.New("insufficient stock")
 
-// CreateReservation — yangi reservation yaratadi.
-// Bu funksiya barcha bosqichlarni transaction ichida boshqaradi.
+type ReservationItemResponse struct {
+	ProductID int64 `json:"product_id"`
+	Quantity  int   `json:"quantity"`
+}
+
+type ReservationResponse struct {
+	ID          int64                     `json:"id"`
+	WarehouseID int64                     `json:"warehouse_id"`
+	Status      string                    `json:"status"`
+	CreatedAt   time.Time                 `json:"created_at"`
+	ExpiresAt   time.Time                 `json:"expires_at"`
+	Items       []ReservationItemResponse `json:"items"`
+}
+
+func (h *Handler) GetReservation(w http.ResponseWriter, r *http.Request) {
+	reservationID, err := strconv.ParseInt(
+		r.PathValue("reservation_id"),
+		10,
+		64,
+	)
+
+	if err != nil {
+		http.Error(w, "invalid reservation id", http.StatusBadRequest)
+		return
+	}
+
+	var resp ReservationResponse
+	resp.ID = reservationID
+
+	err = h.db.QueryRowContext(
+		r.Context(),
+		`
+		SELECT warehouse_id, status, created_at, expires_at
+		FROM reservations
+		WHERE id = $1
+		`,
+		reservationID,
+	).Scan(&resp.WarehouseID, &resp.Status, &resp.CreatedAt, &resp.ExpiresAt)
+
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "reservation not found", http.StatusNotFound)
+		return
+	}
+
+	if err != nil {
+		http.Error(w, "failed to get reservation", http.StatusInternalServerError)
+		return
+	}
+
+	rows, err := h.db.QueryContext(
+		r.Context(),
+		`
+		SELECT product_id, quantity
+		FROM reservation_items
+		WHERE reservation_id = $1
+		`,
+		reservationID,
+	)
+
+	if err != nil {
+		http.Error(w, "failed to get reservation items", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var item ReservationItemResponse
+
+		if err := rows.Scan(&item.ProductID, &item.Quantity); err != nil {
+			http.Error(w, "failed to read reservation item", http.StatusInternalServerError)
+			return
+		}
+
+		resp.Items = append(resp.Items, item)
+	}
+
+	if err := rows.Err(); err != nil {
+		http.Error(w, "failed to read reservation items", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(resp)
+}
+
 func (h *Handler) CreateReservation(w http.ResponseWriter, r *http.Request) {
 
 	idempotencyKey := r.Header.Get("Idempotency-Key")
@@ -148,7 +235,6 @@ func (h *Handler) CreateReservation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Idempotency keyni reservation bilan bog'laymiz.
 	_, err = tx.ExecContext(
 		r.Context(),
 		`
@@ -163,6 +249,34 @@ func (h *Handler) CreateReservation(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if err != nil {
+
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			tx.Rollback()
+
+			var winnerReservationID int64
+
+			lookupErr := h.db.QueryRowContext(
+				r.Context(),
+				`SELECT reservation_id FROM idempotency_keys WHERE idempotency_key = $1`,
+				idempotencyKey,
+			).Scan(&winnerReservationID)
+
+			if lookupErr != nil {
+				http.Error(w, "failed to save idempotency key", http.StatusInternalServerError)
+				return
+			}
+
+			response := map[string]int64{
+				"reservation_id": winnerReservationID,
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(response)
+			return
+		}
+
 		http.Error(w, "failed to save idempotency key", http.StatusInternalServerError)
 		return
 	}
@@ -182,7 +296,6 @@ func (h *Handler) CreateReservation(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-// warehouse, product va quantity qiymatlarini tekshiradi.
 func validateCreateReservationRequest(req CreateReservationRequest) error {
 
 	if req.WarehouseID <= 0 {
@@ -207,7 +320,6 @@ func validateCreateReservationRequest(req CreateReservationRequest) error {
 	return nil
 }
 
-// checkWarehouse — berilgan warehouse database'da mavjudligini tekshiradi.
 func (h *Handler) checkWarehouse(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -239,12 +351,6 @@ func (h *Handler) checkWarehouse(
 	return nil
 }
 
-// checkStock — reservation uchun kerakli productlarning
-// yetarli stocki borligini tekshiradi.
-//
-// FOR UPDATE stock qatorini lock qiladi.
-// Bu bir vaqtning o'zida kelgan requestlar stockni
-// noto'g'ri hisoblab yubormasligi uchun kerak.
 func (h *Handler) checkStock(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -280,8 +386,6 @@ func (h *Handler) checkStock(
 	return nil
 }
 
-// createReservation — reservations jadvaliga
-// yangi reservation yozadi va uning ID'sini qaytaradi.
 func (h *Handler) createReservation(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -315,8 +419,6 @@ func (h *Handler) createReservation(
 	return reservationID, nil
 }
 
-// createReservationItems — reservation_items jadvaliga
-// reservation ichidagi productlarni yozadi.
 func (h *Handler) createReservationItems(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -349,8 +451,6 @@ func (h *Handler) createReservationItems(
 	return nil
 }
 
-// decreaseStock — reservation qilingan quantity miqdorida
-// stock jadvalidagi quantity'ni kamaytiradi.
 func (h *Handler) decreaseStock(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -381,8 +481,87 @@ func (h *Handler) decreaseStock(
 	return nil
 }
 
+func (h *Handler) restoreReservationStock(
+	ctx context.Context,
+	tx *sql.Tx,
+	reservationID int64,
+	warehouseID int64,
+) error {
+
+	type ReservationItem struct {
+		ProductID int64
+		Quantity  int
+	}
+
+	var items []ReservationItem
+
+	rows, err := tx.QueryContext(
+		ctx,
+		`
+		SELECT product_id, quantity
+		FROM reservation_items
+		WHERE reservation_id = $1
+		`,
+		reservationID,
+	)
+
+	if err != nil {
+		return err
+	}
+
+	for rows.Next() {
+		var item ReservationItem
+
+		if err := rows.Scan(&item.ProductID, &item.Quantity); err != nil {
+			rows.Close()
+			return err
+		}
+
+		items = append(items, item)
+	}
+
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+
+	rows.Close()
+
+	for _, item := range items {
+
+		result, err := tx.ExecContext(
+			ctx,
+			`
+			UPDATE stock
+			SET quantity = quantity + $1,
+			    updated_at = NOW()
+			WHERE warehouse_id = $2
+			  AND product_id = $3
+			`,
+			item.Quantity,
+			warehouseID,
+			item.ProductID,
+		)
+
+		if err != nil {
+			return err
+		}
+
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+
+		if affected == 0 {
+			return sql.ErrNoRows
+		}
+	}
+
+	return nil
+}
+
 func (h *Handler) CancelReservation(w http.ResponseWriter, r *http.Request) {
-	// 1. Reservation IDni URLdan olamiz.
+
 	reservationID, err := strconv.ParseInt(
 		r.PathValue("reservation_id"),
 		10,
@@ -394,7 +573,6 @@ func (h *Handler) CancelReservation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Transaction boshlaymiz.
 	tx, err := h.db.BeginTx(r.Context(), nil)
 	if err != nil {
 		http.Error(w, "failed to start transaction", http.StatusInternalServerError)
@@ -403,7 +581,6 @@ func (h *Handler) CancelReservation(w http.ResponseWriter, r *http.Request) {
 
 	defer tx.Rollback()
 
-	// 3. Reservationni topamiz va lock qilamiz.
 	var warehouseID int64
 	var status string
 
@@ -428,116 +605,21 @@ func (h *Handler) CancelReservation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 4. Faqat active reservationni cancel qilamiz.
 	if status != "active" {
 		http.Error(w, "reservation cannot be cancelled", http.StatusConflict)
 		return
 	}
 
-	// 5. Reservation itemlarini avval memoryga olamiz.
-	type ReservationItem struct {
-		ProductID int64
-		Quantity  int
-	}
+	if err := h.restoreReservationStock(r.Context(), tx, reservationID, warehouseID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "stock not found", http.StatusNotFound)
+			return
+		}
 
-	var items []ReservationItem
-
-	rows, err := tx.QueryContext(
-		r.Context(),
-		`
-		SELECT product_id, quantity
-		FROM reservation_items
-		WHERE reservation_id = $1
-		`,
-		reservationID,
-	)
-
-	if err != nil {
-		http.Error(w, "failed to get reservation items", http.StatusInternalServerError)
+		http.Error(w, "failed to restore stock: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	for rows.Next() {
-		var item ReservationItem
-
-		if err := rows.Scan(
-			&item.ProductID,
-			&item.Quantity,
-		); err != nil {
-			rows.Close()
-
-			http.Error(
-				w,
-				"failed to read reservation item",
-				http.StatusInternalServerError,
-			)
-			return
-		}
-
-		items = append(items, item)
-	}
-
-	if err := rows.Err(); err != nil {
-		rows.Close()
-
-		http.Error(
-			w,
-			"failed to read reservation items",
-			http.StatusInternalServerError,
-		)
-		return
-	}
-
-	rows.Close()
-
-	// 6. Endi stockni qaytaramiz.
-	for _, item := range items {
-
-		result, err := tx.ExecContext(
-			r.Context(),
-			`
-			UPDATE stock
-			SET quantity = quantity + $1,
-			    updated_at = NOW()
-			WHERE warehouse_id = $2
-			  AND product_id = $3
-			`,
-			item.Quantity,
-			warehouseID,
-			item.ProductID,
-		)
-
-		if err != nil {
-			http.Error(
-				w,
-				"failed to restore stock: "+err.Error(),
-				http.StatusInternalServerError,
-			)
-			return
-		}
-
-		// Stock qatori topilmagan bo'lsa xato qaytaramiz.
-		affected, err := result.RowsAffected()
-		if err != nil {
-			http.Error(
-				w,
-				"failed to check updated stock",
-				http.StatusInternalServerError,
-			)
-			return
-		}
-
-		if affected == 0 {
-			http.Error(
-				w,
-				"stock not found",
-				http.StatusNotFound,
-			)
-			return
-		}
-	}
-
-	// 7. Reservation statusini cancelled qilamiz.
 	_, err = tx.ExecContext(
 		r.Context(),
 		`
@@ -557,7 +639,6 @@ func (h *Handler) CancelReservation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 8. Barcha o'zgarishlarni commit qilamiz.
 	if err := tx.Commit(); err != nil {
 		http.Error(
 			w,
@@ -567,13 +648,11 @@ func (h *Handler) CancelReservation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 9. Muvaffaqiyatli javob.
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handler) ConfirmReservation(w http.ResponseWriter, r *http.Request) {
 
-	// 1. Reservation IDni URLdan olamiz.
 	reservationID, err := strconv.ParseInt(
 		r.PathValue("reservation_id"),
 		10,
@@ -585,7 +664,6 @@ func (h *Handler) ConfirmReservation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Transaction boshlaymiz.
 	tx, err := h.db.BeginTx(r.Context(), nil)
 	if err != nil {
 		http.Error(w, "failed to start transaction", http.StatusInternalServerError)
@@ -594,19 +672,20 @@ func (h *Handler) ConfirmReservation(w http.ResponseWriter, r *http.Request) {
 
 	defer tx.Rollback()
 
-	// 3. Reservationni topamiz va lock qilamiz.
 	var status string
+	var warehouseID int64
+	var expiresAt time.Time
 
 	err = tx.QueryRowContext(
 		r.Context(),
 		`
-		SELECT status
+		SELECT warehouse_id, status, expires_at
 		FROM reservations
 		WHERE id = $1
 		FOR UPDATE
 		`,
 		reservationID,
-	).Scan(&status)
+	).Scan(&warehouseID, &status, &expiresAt)
 
 	if err == sql.ErrNoRows {
 		http.Error(w, "reservation not found", http.StatusNotFound)
@@ -618,13 +697,35 @@ func (h *Handler) ConfirmReservation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 4. Faqat active reservationni confirm qilish mumkin.
 	if status != "active" {
 		http.Error(w, "reservation cannot be confirmed", http.StatusConflict)
 		return
 	}
 
-	// 5. Reservation statusini confirmed qilamiz.
+	if !expiresAt.After(time.Now().UTC()) {
+		if err := h.restoreReservationStock(r.Context(), tx, reservationID, warehouseID); err != nil {
+			http.Error(w, "failed to restore stock", http.StatusInternalServerError)
+			return
+		}
+
+		if _, err := tx.ExecContext(
+			r.Context(),
+			`UPDATE reservations SET status = 'cancelled' WHERE id = $1`,
+			reservationID,
+		); err != nil {
+			http.Error(w, "failed to expire reservation", http.StatusInternalServerError)
+			return
+		}
+
+		if err := tx.Commit(); err != nil {
+			http.Error(w, "failed to commit transaction", http.StatusInternalServerError)
+			return
+		}
+
+		http.Error(w, "reservation expired", http.StatusConflict)
+		return
+	}
+
 	_, err = tx.ExecContext(
 		r.Context(),
 		`
@@ -640,13 +741,11 @@ func (h *Handler) ConfirmReservation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 6. Barcha o'zgarishni commit qilamiz.
 	if err := tx.Commit(); err != nil {
 		http.Error(w, "failed to commit transaction", http.StatusInternalServerError)
 		return
 	}
 
-	// 7. Muvaffaqiyatli javob.
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -705,9 +804,6 @@ func (h *Handler) ExpireReservations(ctx context.Context) error {
 		return err
 	}
 
-	// Muhim:
-	// reservationlarni o'qib bo'ldik.
-	// Endi rows ochiq emas.
 	rows.Close()
 
 	log.Println(
@@ -773,8 +869,6 @@ func (h *Handler) ExpireReservations(ctx context.Context) error {
 			)
 		}
 
-		// Muhim:
-		// UPDATE qilishdan oldin SELECT rows yopiladi.
 		itemRows.Close()
 
 		for _, item := range items {

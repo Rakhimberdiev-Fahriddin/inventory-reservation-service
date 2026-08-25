@@ -115,15 +115,15 @@ func (h *Handler) GetStock(w http.ResponseWriter, r *http.Request) {
 	}
 
 	responce := StockResponse{
-		ProductID: productID,
-		WarehouseID: warehouseID,
-		PhysicalStock: quantity,
+		ProductID:      productID,
+		WarehouseID:    warehouseID,
+		PhysicalStock:  quantity,
 		AvailableStock: quantity,
 	}
 
-	w.Header().Set("Content-Type","application/json")
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	if err := json.NewEncoder(w).Encode(responce); err != nil{
+	if err := json.NewEncoder(w).Encode(responce); err != nil {
 		return
 	}
 }
